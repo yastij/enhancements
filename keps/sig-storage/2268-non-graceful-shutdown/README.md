@@ -52,37 +52,40 @@ approvers is no longer appropriate than changes to that list should be approved 
 
 ## Summary
 
-In case of an instance being shutdown (i.e. not running) the control plane doesn't make the right
-assumptions to enable stateful workload to fail-over, This KEP introduces a flow to do so.
+In case of a node being shutdown (i.e. not running) the control plane doesn't make the right
+assumptions to enable stateful workload to fail-over. This KEP introduces a flow to do so.
 
 This KEP is part of collection of KEPs that intends to enhance stateful workload management on top of Kubernetes.
 
 ## Motivation
 
-Today kubernetes doesn't enable providers that are able to safely detach (i.e. only detach when volumes aren't being written to) to do so. This proposal aims to introduce a new CSI capability that if advertised would trigger volume detach if a node is partitioned from the control plane.
+Today kubernetes doesn't enable storage providers that are able to safely detach volumes (i.e. only detach when volumes aren't being written to) to do so. This proposal aims to introduce a new CSI capability that if advertised would trigger volume detach if a node is partitioned from the control plane.
 
 ### Goals
 
-* Increase the availability of stateful workloads
-* Automate self-healing for stateful workloads
+* Increase the availability of stateful workloads.
+* Automate self-healing for stateful workloads.
+* This proposal only target CSI volumes.
 
 ### Non-Goals
 
-* Implement in-cluster logic to handle node/control plane partitioning 
-* enable detach for all the storage providers
-
+* Implement in-cluster logic to handle node/control plane partitioning. 
+* Enable detach for all the storage providers.
+* Existing in-tree volumes are not targeted by this proposal.
 
 ## Proposal
 
 User stories:
 
-* As a cluster administrator I want my stateful workload to failover in case of a node is partitioned without any intervention when it's safe to do so
+* As a cluster administrator I want my stateful workload to failover in case a node is partitioned from the control plane without any intervention when it's safe to do so.
 
-* As a developer I would like to rely on a self-healing platform for my stateful workloads
+* As a developer I would like to rely on a self-healing platform for my stateful workloads.
 
-This KEP plans to introduce the following CSI capabilities.
+This KEP plans to introduce the following CSI capabilities as described in this [PR](https://github.com/container-storage-interface/spec/pull/477).
 
-* In the [CSI spec](https://github.com/container-storage-interface/spec/blob/master/spec.md), introduce `UNPUBLISH_FENCE` controller service capablity and `FORCE_UNPUBLISH` node service capability.
+* In the [CSI spec](https://github.com/container-storage-interface/spec/blob/master/spec.md), introduce `UNPUBLISH_FENCE` controller service capability and `FORCE_UNPUBLISH` node service capability.
+  * The `UNPUBLISH_FENCE` controller service capability indicates that the SP supports ControllerUnpublishVolume.fence field.
+  * The `FORCE_UNPUBLISH` node service capability indicates that the SP supports the NodeUnpublishVolume.force field. It also indicates that the SP supports the NodeUnstageVolume.force field if it also has the STAGE_UNSTAGE_VOLUME node service capability.
 
 * In the [CSIDriverSpec](https://github.com/kubernetes/kubernetes/blob/v1.20.2/pkg/apis/storage/types.go#L266), add a `SafeDetach` boolean to indicate if it is safe to detach.
 
@@ -92,30 +95,35 @@ type CSIDriverSpec struct {
   ...
 
   // SafeDetach indicates this CSI volume driver is able to perform detach
-  // operations, when set to true, the CSI volume driver needs to ensure that 
-  // ControllerUnpublishVolume() implementation is checking for detach safety
+  // operations. When set to true, the CSI volume driver needs to ensure that 
+  // ControllerUnpublishVolume() implementation is checking whether a volume
+  // can be detached safely
   // +optional
   SafeDetach *bool
 }
 
 ```
 
-When a node is shut down, the health check in Node lifecycle controller, part of kube-controller-manager, sets Node v1.NodeReady Condition to False or Unknown (unreachable) if lease is not renewed for a specific grace period. Node Status becomes NotReady.
+Existing logic:
+* When a node is partitioned from the control plane, the health check in Node lifecycle controller, part of kube-controller-manager, sets Node v1.NodeReady Condition to False or Unknown (unreachable) if lease is not renewed for a specific grace period. Node Status becomes NotReady.
 
-After 300 seconds (default), the Taint Manager tries to delete Pods on the Node after detecting that the Node is NotReady. The Pods will be stuck in terminating status.
+* After 300 seconds (default), the Taint Manager tries to delete Pods on the Node after detecting that the Node is NotReady. The Pods will be stuck in terminating status.
 
-The Pod GC Controller, part of the kube-controller-manager, would need to go through all the Pods in terminating state, verify that the Node is NotReady, and then check if the `SafeDetach` flag in CSIDriver is set to true. If so, forcefully delete pods that are stuck.
+Proposed logic change:
+* The Pod GC Controller, part of the kube-controller-manager, would need to go through all the Pods in terminating state, verify that the Node is NotReady, and then check if the `SafeDetach` flag in CSIDriver is set to true. If so, forcefully delete pods that are stuck.
 
-Specifically the Pod GC Controller (the only controller able to forcefully delete pods) would also check now for stateful pods, and select those that satisfy ALL of the following conditions:
+* Specifically the Pod GC Controller (the only controller able to forcefully delete pods) would also check now for stateful pods, and select those that satisfy ALL of the following conditions:
 
-- pods that are backed by a provisioner that support safe detach
-- pods that are backed by volumes that aren't marked as `ReadWriteMany, this would avoid breaking having multiple replicas of the same pod.
+  * pods that are backed by a CSI driver that supports `SafeDetach`.
+  * pods that are backed by volumes that aren't marked as `ReadWriteMany`. This would avoid breaking having multiple replicas of the same pod.
 
-Once pods are selected and forcefully deleted, the attachdetach reconciler should check if the `UNPUBLISH_FENCE` CSI controller capability is true. If true, it should skip the `attachedVolume.MountedByNode` check for the volumes backing these pods and allow `ControllerUnpublishVolume` to happen before `NodeUnpublishVolume` and/or `NodeUnstageVolume` are called.
+* Once pods are selected and forcefully deleted, the attachdetach reconciler should check if the `SafeDetach` flag in CSIDriver is set to true. If so, it should skip the `attachedVolume.MountedByNode` check for the volumes backing these pods and allow `volumeAttachement` to be deleted.
 
-This would trigger the deletion of the `volumeAttachement` objects, which would in turn trigger `ControllerUnpublishVolume()`. The provider would need to ensure there that no volume is being used through a mount point. If unable to determine the usage, the storage provider can return an error without detaching the volume, the `external-attacher` would then retry with backoff.
+* This would trigger the deletion of the `volumeAttachement` objects. This would allow `ControllerUnpublishVolume` to happen before `NodeUnpublishVolume` and/or `NodeUnstageVolume` are called.
 
-The Pod GC Controller would also apply a `quarantine` taint on the nodes whose pods are forcefully deleted due to the shutdown.
+* When the `external-attacher` detects the `volumeAttachement` object is being deleted, it needs to check if the `UNPUBLISH_FENCE` CSI controller capability is true. If so, it calls CSI driver's `ControllerUnpublishVolume` and sets `ControllerUnpublishVolume.fence` field to true. The CSI driver would need to ensure that no volume is being used through a mount point. If unable to determine the usage, the CSI driver can return an error without detaching the volume. The `external-attacher` would then retry with backoffs.
+
+* The Pod GC Controller would also apply a `quarantine` taint on the nodes whose pods are forcefully deleted due to the shutdown. This should happen before the pods are being evicted. The "quarantine" taint indicates that new pods should not be scheduled on the node.
 
 ### Handle the Return of Shutdown Node
 
@@ -123,9 +131,11 @@ If the nodes that were previously shutdown with pods forcefully deleted come bac
 
 The health check in Node lifecycle controller, part of kube-controller-manager, sets Node v1.NodeReady Condition to True if lease is renewed again. Node Status becomes Ready.
 
-When the node comes up, Kubelet volume manager reconciler will try to clean up mounts by calling `NodeUnpublishVolume`. Kubelet volume manager reconciler will also try to reconstruct global mount for CSI volumes and call `NodeUnstageVolume`. If there isn't enough information to reconstruct global mount, Kubelet volume manager should forcefully cleanup the [global mount directory](/var/lib/kubelet/plugins/kubernetes.io/csi/pv/{pvname}/globalmount) to avoid problems when new pods are scheduled to this node again.
+When the node comes up, Kubelet volume manager reconciler will try to clean up mounts by calling `NodeUnpublishVolume`. Kubelet volume manager reconciler will also try to reconstruct global mount for CSI volumes and call `NodeUnstageVolume`. If there isn't enough information to reconstruct global mount, Kubelet volume manager should cleanup the [global mount directory](/var/lib/kubelet/plugins/kubernetes.io/csi/pv/{pvname}/globalmount) to avoid problems when new pods are scheduled to this node again.
 
-The Pod GC Controller should also remove the `quarantine` taint from the nodes that are already cleaned up and are safe to run pods again.
+The Pod GC Controller should also remove the `quarantine` taint from the nodes that are already cleaned up and are safe to run pods again. We need to make sure the taint is only removed after detach is finished.
+
+Note: We'll handle the temporarily partitioned node the same way as the shutdown node. Since the `quarantine` taint is applied on the node, we'll clean up everything on the node when its network connectivity is resumed before removing the taint and allowing pods to be scheduled on the node again.
 
 ### Risks and Mitigations
 
